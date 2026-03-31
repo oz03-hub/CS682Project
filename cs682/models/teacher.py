@@ -1,18 +1,3 @@
-"""
-TinyBERT Teacher model for cross-architecture layer-wise distillation.
-
-Wraps huawei-noah/TinyBERT_General_4L_312D with:
-  - A single linear classification head over the final [CLS] token
-  - Intermediate [CLS] extraction at evenly-spaced layers for L_layer
-  - A clean forward() interface consistent with FunnelTransformer student
-
-Typical workflow:
-    1. Fine-tune teacher on downstream task  (teacher.forward(labels=...))
-    2. Freeze teacher                        (teacher.freeze())
-    3. Run distillation loop, passing        teacher.forward() outputs
-       to FunnelTransformer.distillation_loss()
-"""
-
 from __future__ import annotations
 
 import torch
@@ -45,7 +30,6 @@ class BERTTeacher(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        labels: torch.Tensor | None = None,
         **kwargs,
     ) -> dict[str, torch.Tensor]:
         """
@@ -138,16 +122,9 @@ if __name__ == "__main__":
     enc = tokenizer(
         sentences, padding=True, truncation=True, max_length=64, return_tensors="pt"
     )
-    labels = torch.tensor([1, 0])
 
     with torch.no_grad():
-        out = teacher(**enc, labels=labels)
+        out = teacher(**enc)
 
     print("\nlogits shape  :", out["logits"].shape)  # (2, 2)
     print("cls_hiddens   :", [h.shape for h in out["cls_hiddens"]])
-    print("fine-tune loss:", f"{out['loss'].item():.4f}")
-
-    teacher.freeze()
-    with torch.no_grad():
-        out = teacher(**enc)
-    print("\n[frozen] logits:", out["logits"])

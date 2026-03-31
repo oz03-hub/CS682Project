@@ -1,24 +1,3 @@
-"""
-Funnel Transformer with PyTorch native MHA and TinyBERT embeddings/tokenizer.
-
-Architecture follows the paper:
-  "Funnel-Transformer: Filtering Out Sequential Redundancy for Efficient
-   Language Processing" (Dai et al., 2020)
-
-Key differences from the original implementation:
-  - Uses nn.MultiheadAttention instead of manual RelMultiheadAttention
-  - Uses TinyBERT (huggingface: "huawei-noah/TinyBERT_General_4L_312D")
-    for tokenization and initial token embeddings
-  - Block-level average pooling on the sequence dimension between blocks
-    (CLS token is kept separate and not pooled, per the paper)
-  - Supports the three-loss distillation objective described in the paper:
-      L = α * L_task  +  β * L_logit  +  γ * L_layer
-
-Usage:
-    tokenizer = AutoTokenizer.from_pretrained("huawei-noah/TinyBERT_General_4L_312D")
-    model     = FunnelTransformer.from_tinybert(block_size="2_2_2", num_classes=2)
-"""
-
 from __future__ import annotations
 
 import torch
@@ -26,61 +5,54 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModel
 
+# The model used both to seed the student embeddings and as the teacher
+TEACHER_MODEL_NAME = "google/bert_uncased_L-8_H-512_A-8"
 
-# ---------------------------------------------------------------------------
-# Single Transformer layer (MHA + FFN with pre-norm)
-# ---------------------------------------------------------------------------
+# Architecture is always 3 blocks
+N_BLOCKS = 3
+
 
 class TransformerLayer(nn.Module):
-    """One Transformer encoder layer using nn.MultiheadAttention (pre-norm)."""
-
-    def __init__(self, d_model: int, n_head: int, d_ffn: int,
-                 dropout: float = 0.1):
+    def __init__(self, d_model: int, n_head: int, d_ffn: int, dropout: float = 0.1):
         super().__init__()
-        self.attn   = nn.MultiheadAttention(d_model, n_head,
-                                            dropout=dropout,
-                                            batch_first=True)
-        self.ffn    = nn.Sequential(
+        self.attn = nn.MultiheadAttention(
+            d_model, n_head, dropout=dropout, batch_first=True
+        )
+        self.ffn = nn.Sequential(
             nn.Linear(d_model, d_ffn),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(d_ffn, d_model),
         )
-        self.norm1  = nn.LayerNorm(d_model)
-        self.norm2  = nn.LayerNorm(d_model)
-        self.drop   = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.drop = nn.Dropout(dropout)
 
     def forward(
         self,
-        q: torch.Tensor,               # (B, T_q, D)
-        kv: torch.Tensor,              # (B, T_kv, D)  — same as q for non-pooling layers
-        key_padding_mask: torch.Tensor | None = None,  # (B, T_kv) bool, True = ignore
+        q: torch.Tensor,  # (B, T_q, D)
+        kv: torch.Tensor,  # (B, T_kv, D)
+        key_padding_mask: torch.Tensor | None = None,  # (B, T_kv) True=ignore
     ) -> torch.Tensor:
-        # --- Self / cross attention with pre-norm on q ---
         residual = q
-        q_norm   = self.norm1(q)
-        kv_norm  = self.norm1(kv) if kv is not q else q_norm
-        attn_out, _ = self.attn(q_norm, kv_norm, kv_norm,
-                                key_padding_mask=key_padding_mask)
+        q_norm = self.norm1(q)
+        kv_norm = self.norm1(kv) if kv is not q else q_norm
+        attn_out, _ = self.attn(
+            q_norm, kv_norm, kv_norm, key_padding_mask=key_padding_mask
+        )
         x = residual + self.drop(attn_out)
-
-        # --- FFN with pre-norm ---
         x = x + self.drop(self.ffn(self.norm2(x)))
         return x
 
-
-# ---------------------------------------------------------------------------
-# One Funnel block  (N layers + optional pooling at the start)
-# ---------------------------------------------------------------------------
 
 class FunnelBlock(nn.Module):
     """
     A single Funnel Transformer block.
 
-    If `apply_pooling=True`, the sequence (excluding CLS) is average-pooled
-    by `pool_size` at the *beginning* of the block, before the first attention
-    layer. The first layer then uses the pooled sequence as Q and the
-    un-pooled sequence as K/V (pool_q_only=True), or both pooled (default).
+    When apply_pooling=True the sequence (excluding CLS) is average-pooled
+    by pool_size at the start. The first layer uses original K/V and pooled Q
+    (pool_q_only=True); subsequent layers are pure self-attention on the
+    shortened sequence.
     """
 
     def __init__(
@@ -93,116 +65,84 @@ class FunnelBlock(nn.Module):
         apply_pooling: bool = False,
         pool_size: int = 2,
         pool_q_only: bool = True,
-        separate_cls: bool = True,
     ):
         super().__init__()
         self.apply_pooling = apply_pooling
-        self.pool_size     = pool_size
-        self.pool_q_only   = pool_q_only
-        self.separate_cls  = separate_cls
-        self.layers        = nn.ModuleList([
-            TransformerLayer(d_model, n_head, d_ffn, dropout)
-            for _ in range(n_layers)
-        ])
+        self.pool_size = pool_size
+        self.pool_q_only = pool_q_only
+        self.layers = nn.ModuleList(
+            [TransformerLayer(d_model, n_head, d_ffn, dropout) for _ in range(n_layers)]
+        )
 
-    # ------------------------------------------------------------------
-    # helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _avg_pool_seq(x: torch.Tensor, pool_size: int) -> torch.Tensor:
-        """Average-pool the time dimension by `pool_size`. (B, T, D) -> (B, T//pool_size, D)"""
+    def _avg_pool_seq(self, x: torch.Tensor, pool_size: int) -> torch.Tensor:
+        """(B, T, D) -> (B, T//pool_size, D)  via average pooling."""
         B, T, D = x.shape
-        # trim to multiple of pool_size
         T_trim = (T // pool_size) * pool_size
-        return x[:, :T_trim, :].reshape(B, T_trim // pool_size, pool_size, D).mean(dim=2)
+        return x[:, :T_trim].reshape(B, T_trim // pool_size, pool_size, D).mean(2)
 
-    @staticmethod
-    def _pool_mask(mask: torch.Tensor | None,
-                   pool_size: int) -> torch.Tensor | None:
-        """Downsample a key_padding_mask along the sequence dimension."""
+    def _pool_mask(
+        self, mask: torch.Tensor | None, pool_size: int
+    ) -> torch.Tensor | None:
+        """Downsample a key_padding_mask (B, T) by pool_size."""
         if mask is None:
             return None
-        # mask: (B, T), True = ignore
         B, T = mask.shape
         T_trim = (T // pool_size) * pool_size
-        m = mask[:, :T_trim].reshape(B, T_trim // pool_size, pool_size)
-        # a pooled position is masked only if ALL its source tokens are masked
-        return m.all(dim=-1)
-
-    # ------------------------------------------------------------------
+        return mask[:, :T_trim].reshape(B, T_trim // pool_size, pool_size).all(-1)
 
     def forward(
         self,
-        x: torch.Tensor,               # (B, T, D)
+        x: torch.Tensor,  # (B, T, D)
         key_padding_mask: torch.Tensor | None = None,  # (B, T)
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """
-        Returns:
-            output:           (B, T_out, D)
-            key_padding_mask: (B, T_out)  — updated after pooling
-        """
         if self.apply_pooling:
-            if self.separate_cls:
-                # keep CLS separate
-                cls_token = x[:, :1, :]          # (B, 1, D)
-                rest      = x[:, 1:, :]           # (B, T-1, D)
-                cls_mask  = key_padding_mask[:, :1] if key_padding_mask is not None else None
-                rest_mask = key_padding_mask[:, 1:] if key_padding_mask is not None else None
+            # Keep CLS separate; pool the rest
+            cls_token = x[:, :1, :]  # (B, 1, D)
+            rest = x[:, 1:, :]  # (B, T-1, D)
 
-                pooled_rest      = self._avg_pool_seq(rest, self.pool_size)
-                pooled_rest_mask = self._pool_mask(rest_mask, self.pool_size)
+            cls_mask = key_padding_mask[:, :1] if key_padding_mask is not None else None
+            rest_mask = (
+                key_padding_mask[:, 1:] if key_padding_mask is not None else None
+            )
 
-                # first layer: Q = [CLS | pooled_rest], K/V = original x
-                q = torch.cat([cls_token, pooled_rest], dim=1)
-                q_mask = (torch.cat([cls_mask, pooled_rest_mask], dim=1)
-                          if cls_mask is not None else None)
-            else:
-                pooled = self._avg_pool_seq(x, self.pool_size)
-                q      = pooled
-                q_mask = self._pool_mask(key_padding_mask, self.pool_size)
+            pooled_rest = self._avg_pool_seq(rest, self.pool_size)
+            pooled_rest_mask = self._pool_mask(rest_mask, self.pool_size)
 
-            # first layer uses original x as K/V when pool_q_only=True
-            kv      = x      if self.pool_q_only else q
+            # Q = [CLS | pooled_rest]
+            q = torch.cat([cls_token, pooled_rest], dim=1)
+            q_mask = (
+                torch.cat([cls_mask, pooled_rest_mask], dim=1)
+                if cls_mask is not None
+                else None
+            )
+
+            # First layer: K/V from original (un-pooled) sequence when pool_q_only
+            kv = x if self.pool_q_only else q
             kv_mask = key_padding_mask if self.pool_q_only else q_mask
 
             out = self.layers[0](q, kv, key_padding_mask=kv_mask)
-
-            # remaining layers: self-attention on the pooled sequence
+            # kv is now pooled size too
+            # first layer focuses on unpooled kv to capture context from pooling, minimizes context loss
             for layer in self.layers[1:]:
                 out = layer(out, out, key_padding_mask=q_mask)
-
             return out, q_mask
 
         else:
-            # standard self-attention block (no pooling)
             out = x
             for layer in self.layers:
                 out = layer(out, out, key_padding_mask=key_padding_mask)
             return out, key_padding_mask
 
 
-# ---------------------------------------------------------------------------
-# Full Funnel Transformer
-# ---------------------------------------------------------------------------
-
 class FunnelTransformer(nn.Module):
     """
-    Funnel Transformer for sequence classification.
+    Encoder-only Funnel Transformer with a fixed 3-block architecture:
 
-    Args:
-        vocab_size:    vocabulary size
-        d_model:       hidden dimension
-        n_head:        number of attention heads
-        d_ffn:         inner FFN dimension
-        block_layers:  list of ints, number of layers per block
-                       e.g. [2, 2, 2]  →  block_size = "2_2_2"
-        num_classes:   number of output classes
-        dropout:       dropout probability
-        pool_size:     pooling stride between blocks (default 2)
-        pool_q_only:   if True, only Q is pooled at pooling layers
-        separate_cls:  if True, CLS token is excluded from pooling
-        pad_token_id:  token id used for padding (for mask construction)
+        Block 0  (no pooling)       seq_len = T
+        Block 1  (pool by 2)        seq_len = T // 2
+        Block 2  (pool by 2 again)  seq_len = T // 4
+
+    CLS token is kept separate from pooling throughout.
     """
 
     def __init__(
@@ -214,40 +154,37 @@ class FunnelTransformer(nn.Module):
         block_layers: list[int],
         num_classes: int,
         dropout: float = 0.1,
-        pool_size: int = 2,
-        pool_q_only: bool = True,
-        separate_cls: bool = True,
         pad_token_id: int = 0,
     ):
         super().__init__()
+        if len(block_layers) != N_BLOCKS:
+            raise ValueError()
+
         self.pad_token_id = pad_token_id
-        self.separate_cls = separate_cls
-        self.n_blocks     = len(block_layers)
 
-        # Token embedding + layer norm + dropout  (no positional encoding;
-        # relative positions are implicit in the attention bias — a simple
-        # learned absolute positional embedding is added below for stability)
         self.token_emb = nn.Embedding(vocab_size, d_model, padding_idx=pad_token_id)
-        self.pos_emb   = nn.Embedding(512, d_model)          # max 512 positions
-        self.emb_norm  = nn.LayerNorm(d_model)
-        self.emb_drop  = nn.Dropout(dropout)
+        self.pos_emb = nn.Embedding(512, d_model) # max len is not more than 512
+        self.emb_norm = nn.LayerNorm(d_model)
+        self.emb_drop = nn.Dropout(dropout)
 
-        # Funnel blocks
-        self.blocks = nn.ModuleList()
-        for i, n_layers in enumerate(block_layers):
-            self.blocks.append(FunnelBlock(
-                n_layers      = n_layers,
-                d_model       = d_model,
-                n_head        = n_head,
-                d_ffn         = d_ffn,
-                dropout       = dropout,
-                apply_pooling = (i > 0),        # first block has no pooling
-                pool_size     = pool_size,
-                pool_q_only   = pool_q_only,
-                separate_cls  = separate_cls,
-            ))
+        # Block 0: no pooling; Blocks 1 & 2: halve the sequence
+        self.blocks = nn.ModuleList(
+            [
+                FunnelBlock(
+                    n_layers=n_layers,
+                    d_model=d_model,
+                    n_head=n_head,
+                    d_ffn=d_ffn,
+                    dropout=dropout,
+                    apply_pooling=(i > 0),
+                    pool_size=2,
+                    pool_q_only=True,
+                )
+                for i, n_layers in enumerate(block_layers)
+            ]
+        )
 
-        # Classification head over the final [CLS] token
+        # Classification head over the final [CLS]
         self.cls_head = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.Tanh(),
@@ -255,233 +192,95 @@ class FunnelTransformer(nn.Module):
             nn.Linear(d_model, num_classes),
         )
 
-    # ------------------------------------------------------------------
-
     def forward(
         self,
-        input_ids: torch.Tensor,              # (B, T)
-        attention_mask: torch.Tensor | None = None,  # (B, T), 1=attend 0=ignore
+        input_ids: torch.Tensor,  # (B, T)
+        attention_mask: torch.Tensor | None = None,  # (B, T) 1=attend 0=pad
+        **kwargs,
     ) -> dict[str, torch.Tensor]:
         """
-        Returns a dict with:
-            logits        (B, num_classes)
-            cls_hiddens   list of (B, D) — CLS representation at each block output
-                          used for layer-wise distillation (L_layer)
+        Returns:
+            logits      (B, num_classes)
+            cls_hiddens list of 3 tensors (B, D) — CLS at end of each block;
+                        used for layer-wise distillation
         """
         B, T = input_ids.shape
 
-        # Build key_padding_mask: True where we should IGNORE the token
         if attention_mask is not None:
-            pad_mask = (attention_mask == 0)          # (B, T)
+            pad_mask = attention_mask == 0
         else:
-            pad_mask = (input_ids == self.pad_token_id)
+            pad_mask = input_ids == self.pad_token_id
 
-        # Embeddings
-        positions = torch.arange(T, device=input_ids.device).unsqueeze(0)  # (1, T)
+        positions = torch.arange(T, device=input_ids.device).unsqueeze(0)
         x = self.token_emb(input_ids) + self.pos_emb(positions)
         x = self.emb_drop(self.emb_norm(x))
 
-        # Pass through blocks, collect CLS at each block exit
-        cls_hiddens = []
+        cls_hiddens: list[torch.Tensor] = []
         for block in self.blocks:
             x, pad_mask = block(x, pad_mask)
-            cls_hiddens.append(x[:, 0, :])            # (B, D)
+            cls_hiddens.append(x[:, 0, :])  # (B, D) — CLS at block exit
 
-        logits = self.cls_head(x[:, 0, :])
+        logits = self.cls_head(cls_hiddens[-1])
 
-        return {
-            "logits":      logits,
-            "cls_hiddens": cls_hiddens,   # [block0_cls, block1_cls, block2_cls, ...]
-        }
+        return {"logits": logits, "cls_hiddens": cls_hiddens}
 
-    # ------------------------------------------------------------------
-    # Distillation loss
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def distillation_loss(
-        student_out:    dict,
-        teacher_logits: torch.Tensor,
-        teacher_cls:    list[torch.Tensor],
-        labels:         torch.Tensor,
-        alpha: float = 1.0,
-        beta:  float = 1.0,
-        gamma: float = 1.0,
-        temperature: float = 4.0,
-    ) -> dict[str, torch.Tensor]:
-        """
-        Combined distillation objective (Eq. 4 in the paper):
-            L = α * L_task  +  β * L_logit  +  γ * L_layer
-
-        Args:
-            student_out:    output dict from FunnelTransformer.forward()
-            teacher_logits: (B, C)  — teacher's final logits
-            teacher_cls:    list of (B, D) — teacher CLS at mapped layers
-                            must have the same length as student's block count
-            labels:         (B,)   — ground truth class indices
-            alpha, beta, gamma: loss weights
-            temperature:    softmax temperature for KL loss
-
-        Returns:
-            dict with keys: loss, l_task, l_logit, l_layer
-        """
-        s_logits     = student_out["logits"]
-        s_cls_list   = student_out["cls_hiddens"]
-
-        # L_task  — cross-entropy with ground truth
-        l_task = F.cross_entropy(s_logits, labels)
-
-        # L_logit — KL divergence between soft distributions
-        s_soft = F.log_softmax(s_logits   / temperature, dim=-1)
-        t_soft = F.softmax(teacher_logits / temperature, dim=-1)
-        l_logit = F.kl_div(s_soft, t_soft, reduction="batchmean") * (temperature ** 2)
-
-        # L_layer — MSE between CLS representations at each block
-        assert len(s_cls_list) == len(teacher_cls), (
-            f"Student has {len(s_cls_list)} blocks but {len(teacher_cls)} "
-            "teacher CLS tensors were provided."
-        )
-        l_layer = sum(
-            F.mse_loss(s_cls, t_cls)
-            for s_cls, t_cls in zip(s_cls_list, teacher_cls)
-        ) / len(s_cls_list)
-
-        loss = alpha * l_task + beta * l_logit + gamma * l_layer
-
-        return {
-            "loss":    loss,
-            "l_task":  l_task.detach(),
-            "l_logit": l_logit.detach(),
-            "l_layer": l_layer.detach(),
-        }
-
-    # ------------------------------------------------------------------
-    # Factory: build from TinyBERT checkpoint
-    # ------------------------------------------------------------------
-
+    # use this method mostly
     @classmethod
-    def from_tinybert(
+    def from_bert(
         cls,
-        block_size:  str  = "2_2_2",
-        num_classes: int  = 2,
-        dropout:     float = 0.1,
-        pool_size:   int  = 2,
-        pool_q_only: bool = True,
-        separate_cls: bool = True,
-        model_name:  str  = "huawei-noah/TinyBERT_General_4L_312D",
+        block_layers: list[int] = [2, 2, 2],
+        num_classes: int = 2,
+        dropout: float = 0.1,
+        model_name: str = TEACHER_MODEL_NAME,
     ) -> tuple["FunnelTransformer", object]:
-        """
-        Build a FunnelTransformer whose token embedding matrix and vocabulary
-        are copied from TinyBERT.
+        if len(block_layers) != N_BLOCKS:
+            raise ValueError()
 
-        Returns:
-            model:     FunnelTransformer (with TinyBERT embeddings frozen by default)
-            tokenizer: HuggingFace tokenizer for TinyBERT
-        """
-        print(f"Loading TinyBERT from '{model_name}' …")
-        tokenizer   = AutoTokenizer.from_pretrained(model_name)
-        tinybert    = AutoModel.from_pretrained(model_name)
-        tb_cfg      = tinybert.config
+        print(f"Loading '{model_name}' for embedding initialisation ...")
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        bert = AutoModel.from_pretrained(model_name)
+        cfg = bert.config
 
-        # parse block_size string, e.g. "2_2_2" -> [2, 2, 2]
-        block_layers = [int(b.split("x")[0]) for b in block_size.split("_")]
-
-        # Build funnel model matching TinyBERT's embedding dimension
         model = cls(
-            vocab_size   = tb_cfg.vocab_size,
-            d_model      = tb_cfg.hidden_size,
-            n_head       = tb_cfg.num_attention_heads,
-            d_ffn        = tb_cfg.intermediate_size,
-            block_layers = block_layers,
-            num_classes  = num_classes,
-            dropout      = dropout,
-            pool_size    = pool_size,
-            pool_q_only  = pool_q_only,
-            separate_cls = separate_cls,
-            pad_token_id = tokenizer.pad_token_id,
+            vocab_size=cfg.vocab_size,
+            d_model=cfg.hidden_size,
+            n_head=cfg.num_attention_heads,
+            d_ffn=cfg.intermediate_size,
+            block_layers=block_layers,
+            num_classes=num_classes,
+            dropout=dropout,
+            pad_token_id=tokenizer.pad_token_id,
         )
 
-        # Copy TinyBERT's pretrained token embeddings
+        # copy pre-trained initial embedding weights
         with torch.no_grad():
-            model.token_emb.weight.copy_(
-                tinybert.embeddings.word_embeddings.weight
-            )
-            # also copy positional embeddings if sizes match
-            tb_pos = tinybert.embeddings.position_embeddings.weight
-            n = min(model.pos_emb.weight.shape[0], tb_pos.shape[0])
-            model.pos_emb.weight[:n].copy_(tb_pos[:n])
+            model.token_emb.weight.copy_(bert.embeddings.word_embeddings.weight)
+            src_pos = bert.embeddings.position_embeddings.weight
+            n_copy = min(model.pos_emb.weight.shape[0], src_pos.shape[0])
+            model.pos_emb.weight[:n_copy].copy_(src_pos[:n_copy])
 
         print(
-            f"  ✓ Copied token embeddings  ({tb_cfg.vocab_size} × {tb_cfg.hidden_size})\n"
-            f"  ✓ Copied positional embeddings (first {n} positions)\n"
+            f"  Copied token embeddings  ({cfg.vocab_size} x {cfg.hidden_size})\n"
+            f"  Copied positional embeddings (first {n_copy} positions)\n"
             f"  Block config: {block_layers}  |  num_classes: {num_classes}"
         )
 
-        # Free TinyBERT weights — we only needed the embeddings
-        del tinybert
-
+        del bert
         return model, tokenizer
 
-
-# ---------------------------------------------------------------------------
-# Convenience: build the BERT teacher used in the paper
-# ---------------------------------------------------------------------------
-
-def build_bert_teacher(
-    num_classes: int,
-    model_name: str = "google-bert/bert-base-uncased",
-) -> tuple[nn.Module, object]:
-    """
-    Fine-tunable BERT_BASE teacher with a linear classification head.
-    Returns (model, tokenizer).
-    """
-    from transformers import AutoModelForSequenceClassification
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model     = AutoModelForSequenceClassification.from_pretrained(
-        model_name, num_labels=num_classes
-    )
-    return model, tokenizer
-
-
-# ---------------------------------------------------------------------------
-# Quick smoke-test
-# ---------------------------------------------------------------------------
-
 if __name__ == "__main__":
-    # Build a 2-2-2 Funnel student with TinyBERT embeddings
-    model, tokenizer = FunnelTransformer.from_tinybert(
-        block_size  = "2_2_2",
-        num_classes = 2,
-    )
-    model.eval()
-
+    student, tokenizer = FunnelTransformer.from_bert()
+    student.eval()
     sentences = [
         "The movie was absolutely fantastic!",
         "I did not enjoy this film at all.",
     ]
-    enc = tokenizer(sentences, padding=True, truncation=True,
-                    max_length=64, return_tensors="pt")
+    enc = tokenizer(
+        sentences, padding=True, truncation=True, max_length=64, return_tensors="pt"
+    )
 
     with torch.no_grad():
-        out = model(enc["input_ids"], enc["attention_mask"])
+        out = student(**enc)
 
-    print("\nlogits shape :", out["logits"].shape)         # (2, 2)
-    print("CLS per block:", [h.shape for h in out["cls_hiddens"]])  # [(2,312), (2,312), (2,312)]
-
-    # ---- Simulate one distillation step ----
-    # Fake teacher outputs (in practice, run BERT teacher forward pass)
-    B, D = 2, model.token_emb.weight.shape[1]
-    fake_teacher_logits = torch.randn(B, 2)
-    fake_teacher_cls    = [torch.randn(B, D) for _ in range(3)]  # one per student block
-    labels              = torch.tensor([1, 0])
-
-    losses = FunnelTransformer.distillation_loss(
-        student_out    = out,
-        teacher_logits = fake_teacher_logits,
-        teacher_cls    = fake_teacher_cls,
-        labels         = labels,
-        alpha=1.0, beta=1.0, gamma=1.0,
-    )
-    print("\nDistillation losses:")
-    for k, v in losses.items():
-        print(f"  {k}: {v.item():.4f}")
+    print("\nlogits shape  :", out["logits"].shape)  # (2, 2)
+    print("cls_hiddens   :", [h.shape for h in out["cls_hiddens"]])
