@@ -83,7 +83,6 @@ class FunnelBlock(nn.Module):
     def _pool_mask(
         self, mask: torch.Tensor | None, pool_size: int
     ) -> torch.Tensor | None:
-        """Downsample a key_padding_mask (B, T) by pool_size."""
         if mask is None:
             return None
         B, T = mask.shape
@@ -136,12 +135,7 @@ class FunnelBlock(nn.Module):
 
 class FunnelTransformer(nn.Module):
     """
-    Encoder-only Funnel Transformer with a fixed 3-block architecture:
-
-        Block 0  (no pooling)       seq_len = T
-        Block 1  (pool by 2)        seq_len = T // 2
-        Block 2  (pool by 2 again)  seq_len = T // 4
-
+    Encoder-only Funnel Transformer with a fixed 3-block architecture.
     CLS token is kept separate from pooling throughout.
     """
 
