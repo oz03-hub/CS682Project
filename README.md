@@ -30,37 +30,15 @@ A custom encoder-only Funnel Transformer with a fixed **3-block** architecture:
 The combined loss used in `StudentTrain.ipynb`:
 
 ```
-L = α · L_task  +  β · L_logit  +  γ · L_layer
+L = α · L_task  +  γ · L_layer
 ```
 
 | Term | Description |
 |------|-------------|
 | `L_task` | Cross-entropy with ground-truth labels |
-| `L_logit` | KL divergence between soft teacher/student outputs (temperature-scaled) |
 | `L_layer` | MSE between teacher and student `[CLS]` hidden states at mapped block boundaries |
 
-## Datasets
 
-Raw CSV files live under `cs682/data/`.
-
-## Repository Structure
-
-```
-.
-├── TeacherTrain.ipynb      # Fine-tune BERT teacher on a chosen dataset
-├── StudentTrain.ipynb      # Distil teacher into the Funnel Transformer student
-├── models/                 # Trained models live here
-└── cs682/
-    ├── models/
-    │   ├── teacher.py      # BERTTeacher module
-    │   └── student.py      # FunnelTransformer module
-    ├── data/
-    │   ├── loader.py       # IMDBDataset, YelpDataset, AmazonDataset
-    │   ├── imdb/
-    │   ├── yelp/
-    │   └── amazon/
-    └── evaluator.py        # Accuracy, precision, recall evaluation
-```
 
 ## Workflow
 Same as CS682 HWs.
